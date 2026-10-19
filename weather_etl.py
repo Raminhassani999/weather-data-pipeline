@@ -1,21 +1,18 @@
 import os
-import time
 import httpx
 import pandas as pd
 import psycopg
 from dotenv import load_dotenv
 
+
 load_dotenv()
 
-API_URL = "https://api.open-meteo.com/v1/forecast"
 
-LOCATION = "Messina"
-LATITUDE = 38.1938
-LONGITUDE = 15.5540
+url = "https://api.open-meteo.com/v1/forecast"
 
-PARAMS = {
-    "latitude": LATITUDE,
-    "longitude": LONGITUDE,
+params = {
+    "latitude": 38.1938,
+    "longitude": 15.5540,
     "hourly": (
         "temperature_2m,"
         "relative_humidity_2m,"
@@ -28,57 +25,22 @@ PARAMS = {
     "timezone": "Europe/Rome",
 }
 
+location = "Messina"
 
-def extract_weather(max_attempts=5):
-    last_error = None
 
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = httpx.get(
-                API_URL,
-                params=PARAMS,
-                timeout=30.0,
-            )
-            response.raise_for_status()
+def extract_weather():
+    response = httpx.get(url, params=params, timeout=30.0)
+    response.raise_for_status()
 
-            data = response.json()
+    data = response.json()
 
-            print(
-                f"Extracted {len(data['hourly']['time'])} "
-                "forecast records."
-            )
+    print("Weather data extracted successfully.")
+    return data
 
-            return data
-
-        except httpx.HTTPStatusError as exc:
-            # Retry rate limits and temporary server errors
-            if exc.response.status_code not in {
-                429, 500, 502, 503, 504
-            }:
-                raise
-
-            last_error = exc
-
-        except (httpx.TimeoutException, httpx.NetworkError) as exc:
-            last_error = exc
-
-        if attempt < max_attempts:
-            delay = 2 ** attempt
-
-            print(
-                f"Request failed on attempt {attempt}/{max_attempts}. "
-                f"Retrying in {delay} seconds..."
-            )
-
-            time.sleep(delay)
-
-    raise RuntimeError(
-        f"Open-Meteo request failed after {max_attempts} attempts."
-    ) from last_error
 
 
 def transform_weather(data):
-
+    
     df = pd.DataFrame(data["hourly"])
 
     df = df.rename(columns={
@@ -90,31 +52,31 @@ def transform_weather(data):
         "wind_speed_10m": "wind_speed_kmh",
     })
 
-    df["forecast_time"] = pd.to_datetime(
-        df["forecast_time"],
-        errors="raise",
-    )
+    df["forecast_time"] = pd.to_datetime(df["forecast_time"])
 
-    df["location"] = LOCATION
+    df["location"] = location
     df["latitude"] = data["latitude"]
     df["longitude"] = data["longitude"]
     df["timezone"] = data["timezone"]
 
-    columns = [
-        "location",
-        "forecast_time",
-        "latitude",
-        "longitude",
-        "timezone",
-        "temperature_c",
-        "humidity_percent",
-        "apparent_temperature_c",
-        "precipitation_mm",
-        "weather_code",
-        "wind_speed_kmh",
+    df = df[
+        [
+            "location",
+            "forecast_time",
+            "latitude",
+            "longitude",
+            "timezone",
+            "temperature_c",
+            "humidity_percent",
+            "apparent_temperature_c",
+            "precipitation_mm",
+            "weather_code",
+            "wind_speed_kmh",
+        ]
     ]
 
-    df = df[columns]
+
+    df = df.astype(object).where(pd.notna(df), None)
 
     rows = []
 
@@ -123,47 +85,24 @@ def transform_weather(data):
 
         for value in row:
             if pd.isna(value):
-                clean_row.append(None)
+                value = None
             elif isinstance(value, pd.Timestamp):
-                clean_row.append(value.to_pydatetime())
+                value = value.to_pydatetime()
             elif hasattr(value, "item"):
-                clean_row.append(value.item())
-            else:
-                clean_row.append(value)
+                value = value.item()
+
+            clean_row.append(value)
 
         rows.append(tuple(clean_row))
 
     print(f"Transformed {len(rows)} records using Pandas.")
-
     return rows
 
-
 def load_weather(rows):
-    """Load weather records into PostgreSQL."""
-
-    required_settings = [
-        "POSTGRES_DB",
-        "POSTGRES_USER",
-        "POSTGRES_PASSWORD",
-    ]
-
-    missing_settings = [
-        key for key in required_settings
-        if not os.getenv(key)
-    ]
-
-    if missing_settings:
-        raise ValueError(
-            f"Missing database settings: {', '.join(missing_settings)}"
-        )
-
-    if not rows:
-        raise ValueError("No weather records available to load.")
-
     with psycopg.connect(
-        dbname=os.environ["POSTGRES_DB"],
-        user=os.environ["POSTGRES_USER"],
-        password=os.environ["POSTGRES_PASSWORD"],
+        dbname=os.getenv("POSTGRES_DB"),
+        user=os.getenv("POSTGRES_USER"),
+        password=os.getenv("POSTGRES_PASSWORD"),
         host=os.getenv("POSTGRES_HOST", "localhost"),
         port=int(os.getenv("POSTGRES_PORT", "5433")),
     ) as conn:
@@ -184,15 +123,10 @@ def load_weather(rows):
                     weather_code,
                     wind_speed_kmh
                 )
-                VALUES (
-                    %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s
-                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+
                 ON CONFLICT (location, forecast_time)
                 DO UPDATE SET
-                    latitude = EXCLUDED.latitude,
-                    longitude = EXCLUDED.longitude,
-                    timezone = EXCLUDED.timezone,
                     temperature_c = EXCLUDED.temperature_c,
                     humidity_percent = EXCLUDED.humidity_percent,
                     apparent_temperature_c = EXCLUDED.apparent_temperature_c,
@@ -206,15 +140,12 @@ def load_weather(rows):
 
     print(f"Loaded {len(rows)} records into PostgreSQL.")
 
-
 def main():
-    """Run the complete ETL pipeline."""
-
     data = extract_weather()
     rows = transform_weather(data)
     load_weather(rows)
 
-    print("WEATHER ETL PIPELINE COMPLETED SUCCESSFULLY")
+    print("ETL PIPELINE COMPLETED SUCCESSFULLY")
 
 
 if __name__ == "__main__":
